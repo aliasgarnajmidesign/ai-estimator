@@ -1,16 +1,13 @@
 import os
 import io
-import math
-import time
-import hashlib
+import json
+import base64
 import tempfile
-import requests
 import pandas as pd
 import streamlit as st
-import PyPDF2
-import re
 
-# Try to import CAD and conversion libraries
+# Document & CAD Processing
+import fitz  # PyMuPDF
 try:
     import ezdxf
     EZDXF_AVAILABLE = True
@@ -23,51 +20,103 @@ try:
 except ImportError:
     CLOUDCONVERT_AVAILABLE = False
 
-# ==============================================================================
-# 1. PDF EXTRACTION LOGIC
-# ==============================================================================
-def extract_from_pdf(file_obj):
-    try:
-        reader = PyPDF2.PdfReader(file_obj)
-        full_text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                full_text += page_text + "\n"
-        
-        t = full_text.lower()
-        # Find measurements like "120 sqm" or "50 m"
-        area_matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:sqm|m²|sq\.?\s*m|square\s*meter)', t)
-        linear_matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:m\b|meter|metre|lm\b|linear\s*meter)', t)
-        room_matches = re.findall(r'(\d+)\s*(?:bedroom|room|rooms|nos\b)', t)
-
-        if len(area_matches) >= 1:
-            floor_area = float(area_matches[0])
-        else:
-            # Smart fallback based on file content hash (diff value per file)
-            file_hash = hashlib.md5(full_text.encode()).hexdigest()
-            floor_area = 80 + (int(file_hash[:2], 16) % 60)
-
-        wall_area = float(area_matches[1]) if len(area_matches) >= 2 else floor_area * 2.7
-        perimeter = float(linear_matches[0]) if len(linear_matches) >= 1 else 4 * (floor_area ** 0.5)
-        rooms = int(room_matches[0]) if room_matches else max(1, int(floor_area / 25))
-
-        return {
-            "Floor Area": round(floor_area, 1),
-            "Wall Area": round(wall_area, 1),
-            "Perimeter": round(perimeter, 1),
-            "Rooms": rooms,
-            "Status": "Success" if area_matches else "Estimated"
-        }
-    except Exception as e:
-        return {"Floor Area": 100.5, "Wall Area": 250.2, "Perimeter": 50.3, "Rooms": 4, "Status": f"Error: {e}"}
+# AI API
+from openai import OpenAI
 
 # ==============================================================================
-# 2. CAD EXTRACTION LOGIC (DXF/DWG)
+# 🧠 AI VISION AGENT (THE MAGIC)
 # ==============================================================================
-def extract_from_dxf(file_bytes):
+def analyze_image_with_ai(image_bytes, api_key, is_elevation=False):
+    """Sends the floor plan/elevation to GPT-4o Vision to extract exact rooms and materials."""
+    client = OpenAI(api_key=api_key)
+    base64_image = base64.b64encode(image_bytes).decode('utf-8')
+    
+    doc_type = "elevation drawing" if is_elevation else "floor plan"
+    
+    system_prompt = f"""
+    You are an expert AI Quantity Surveyor and Architect. 
+    Analyze this {doc_type}. 
+    
+    TASKS:
+    1. Identify all rooms/spaces (or facade areas if elevation). Look for text labels and dimensions.
+    2. Calculate or extract the Floor Area (sqm) and Perimeter (m) for each space. If dimensions are missing, use standard architectural proportions to estimate based on the drawing.
+    3. Define logical, professional materials for the floors and walls based on the room type (e.g., Bathrooms get Ceramic Tiles and Moisture-resistant paint/tiles. Bedrooms get Wooden Flooring or Porcelain and Emulsion Paint).
+    
+    OUTPUT EXACTLY IN THIS JSON FORMAT:
+    {{
+        "rooms": [
+            {{
+                "Room Name": "Master Bedroom",
+                "Floor Area (sqm)": 24.5,
+                "Perimeter (m)": 20.0,
+                "Floor Material": "Wood Flooring",
+                "Wall Material": "Emulsion Paint"
+            }}
+        ]
+    }}
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={ "type": "json_object" },
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [
+                {"type": "text", "text": "Please analyze this drawing and extract the BOQ data."},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_image}"}}
+            ]}
+        ]
+    )
+    
+    return json.loads(response.choices[0].message.content)
+
+def analyze_dxf_with_ai(dxf_text_summary, api_key):
+    """Uses AI to clean up raw CAD data and assign materials."""
+    client = OpenAI(api_key=api_key)
+    system_prompt = """
+    You are an expert AI Quantity Surveyor. I am giving you raw geometric data extracted from a DXF CAD file.
+    Clean up the room names, verify the areas, calculate perimeters, and suggest Floor and Wall materials for each room.
+    
+    OUTPUT EXACTLY IN THIS JSON FORMAT:
+    {
+        "rooms": [
+            {
+                "Room Name": "Living Room",
+                "Floor Area (sqm)": 30.0,
+                "Perimeter (m)": 22.0,
+                "Floor Material": "Porcelain Tiles",
+                "Wall Material": "Emulsion Paint"
+            }
+        ]
+    }
+    """
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={ "type": "json_object" },
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Here is the raw CAD data:\n{dxf_text_summary}"}
+        ]
+    )
+    return json.loads(response.choices[0].message.content)
+
+# ==============================================================================
+# 📄 PDF PROCESSING
+# ==============================================================================
+def convert_pdf_to_image(pdf_bytes):
+    """Converts the first page of a PDF to an image for the AI to 'see'."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc.load_page(0)
+    pix = page.get_pixmap(dpi=200) # High DPI for clear text reading
+    return pix.tobytes("png")
+
+# ==============================================================================
+# 📐 CAD PROCESSING
+# ==============================================================================
+def extract_raw_dxf_data(file_bytes):
+    """Extracts raw lines, text, and polygons from DXF."""
     if not EZDXF_AVAILABLE:
-        return None
+        return "Error: ezdxf not installed."
     
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
         tmp.write(file_bytes)
@@ -77,105 +126,127 @@ def extract_from_dxf(file_bytes):
         doc = ezdxf.readfile(tmp_path)
         msp = doc.modelspace()
         
-        total_area = 0.0
-        total_perimeter = 0.0
+        texts = [e.dxf.text for e in msp.query('TEXT')]
+        polys = [e for e in msp.query('LWPOLYLINE') if e.closed]
         
-        # Simple loop to sum areas of closed polylines
-        for entity in msp.query('LWPOLYLINE'):
-            if entity.closed:
-                # This is a simplification; real CAD parsing is complex
-                # We use the bbox as a rough estimate for area
-                bbox = entity.bounding_box()
-                width = bbox[1][0] - bbox[0][0]
-                height = bbox[1][1] - bbox[0][1]
-                total_area += (width * height)
-                total_perimeter += (2 * (width + height))
-        
-        # Fallback if no closed polylines found
-        if total_area == 0:
-            total_area, total_perimeter = 125.0, 45.0
-            
-        return {
-            "Floor Area": round(total_area, 1),
-            "Wall Area": round(total_perimeter * 3.0, 1), # Assuming 3m height
-            "Perimeter": round(total_perimeter, 1),
-            "Rooms": max(1, int(total_area / 25)),
-            "Status": "CAD Parsed"
-        }
+        summary = f"Found {len(polys)} enclosed spaces/rooms.\n"
+        summary += f"Found Text Labels: {', '.join(texts[:20])}...\n"
+        summary += "Approximate geometries found. Please estimate areas based on standard room sizes for these labels."
+        return summary
     finally:
         os.unlink(tmp_path)
 
-def convert_dwg_to_dxf(dwg_bytes, api_key):
-    if not CLOUDCONVERT_AVAILABLE or not api_key:
-        st.error("CloudConvert API Key required for DWG files!")
-        return None
-    
-    # Simple logic for CloudConvert API
-    st.info("Converting DWG to DXF via CloudConvert...")
-    # (Implementation details omitted for brevity; this assumes proper setup)
-    # In a real app, you'd use the CloudConvert SDK here.
-    return dwg_bytes # Placeholder for demo purposes
-
 # ==============================================================================
-# 3. UI & APP LOGIC
+# 🖥️ STREAMLIT UI APP
 # ==============================================================================
-st.set_page_config(page_title="AI Fiesta Estimator", layout="wide")
-st.title("🏗️ AI Estimator (PDF, Excel & CAD)")
+st.set_page_config(page_title="AI Estimator Pro", layout="wide", page_icon="🏗️")
 
+st.title("🏗️ AI Vision Estimator Pro")
+st.markdown("Upload a PDF Plan, Elevation, or CAD file. The **AI will visually analyze it**, identify rooms, dimensions, and automatically assign editable materials.")
+
+# --- SIDEBAR ---
 with st.sidebar:
-    st.header("Settings")
-    cc_api_key = st.text_input("CloudConvert API Key (for .DWG)", type="password")
+    st.header("🔑 AI Settings")
+    openai_key = st.text_input("OpenAI API Key (Required for AI)", type="password", help="Starts with 'sk-...'")
+    cc_key = st.text_input("CloudConvert API Key (for .DWG)", type="password")
+    
     st.divider()
-    wastage = st.slider("Wastage (%)", 0, 20, 5)
-    overhead = st.slider("Overhead/Profit (%)", 0, 30, 10)
+    st.header("⚙️ Estimating Rules")
+    wall_height = st.number_input("Standard Wall Height (m)", 2.5, 6.0, 3.0, 0.1)
+    wastage = st.slider("Wastage (%)", 0, 30, 5)
 
-tab1, tab2, tab3 = st.tabs(["📄 PDF Floor Plan", "📊 Excel BOQ", "📐 CAD (DXF/DWG)"])
+tab1, tab2 = st.tabs(["📄 AI Plan/Elevation Analyzer", "📐 AI CAD Analyzer"])
 
-# --- TAB 1: PDF ---
+# --- TAB 1: PDF VISION AI ---
 with tab1:
-    pdf_file = st.file_uploader("Upload PDF Plan", type=["pdf"])
-    if pdf_file and st.button("Generate Estimate from PDF"):
-        res = extract_from_pdf(pdf_file)
-        st.success(f"Status: {res['Status']}")
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.info("Upload an architectural floor plan or elevation. The AI will read the text and dimensions directly from the image.")
+        drawing_type = st.radio("Drawing Type:", ["Floor Plan", "Elevation"])
+        pdf_file = st.file_uploader("Upload PDF Drawing", type=["pdf"])
         
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Floor Area", f"{res['Floor Area']} m²")
-        col2.metric("Wall Area", f"{res['Wall Area']} m²")
-        col3.metric("Perimeter", f"{res['Perimeter']} m")
-        
-        # Display simple calculation table
-        df = pd.DataFrame({
-            "Item": ["Flooring", "Painting", "Skirting"],
-            "Qty": [res['Floor Area'], res['Wall Area'], res['Perimeter']],
-            "Unit": ["sqm", "sqm", "lm"],
-            "Rate (AED)": [50.0, 15.0, 25.0]
-        })
-        df["Total"] = (df["Qty"] * df["Rate (AED)"] * (1 + wastage/100)).round(2)
-        st.table(df)
-
-# --- TAB 2: EXCEL ---
-with tab2:
-    excel_file = st.file_uploader("Upload Excel BOQ", type=["xlsx", "xls"])
-    if excel_file:
-        df_excel = pd.read_excel(excel_file)
-        st.dataframe(df_excel)
-
-# --- TAB 3: CAD ---
-with tab3:
-    cad_file = st.file_uploader("Upload CAD File", type=["dxf", "dwg"])
-    if cad_file:
-        if cad_file.name.endswith(".dwg"):
-            dxf_data = convert_dwg_to_dxf(cad_file.read(), cc_api_key)
-        else:
-            dxf_data = cad_file.read()
-            
-        if st.button("Process CAD File"):
-            res = extract_from_dxf(dxf_data)
-            if res:
-                st.write("### Extracted from CAD:")
-                st.json(res)
+        if pdf_file and st.button("🚀 Analyze with AI Magic", type="primary"):
+            if not openai_key:
+                st.error("⚠️ Please enter your OpenAI API Key in the sidebar to use Vision AI.")
             else:
-                st.error("Please ensure 'ezdxf' is in requirements.txt")
+                with st.spinner("🤖 AI is looking at your drawing and calculating..."):
+                    try:
+                        # 1. Convert PDF to Image
+                        img_bytes = convert_pdf_to_image(pdf_file.read())
+                        
+                        # 2. Send to AI Vision
+                        ai_result = analyze_image_with_ai(img_bytes, openai_key, is_elevation=(drawing_type=="Elevation"))
+                        
+                        # Save to session state so it doesn't disappear
+                        st.session_state['ai_data'] = pd.DataFrame(ai_result['rooms'])
+                        st.success("✅ AI Analysis Complete!")
+                    except Exception as e:
+                        st.error(f"Error during AI analysis: {e}")
 
-st.markdown("---")
-st.caption("AI Fiesta Estimator - 2024")
+    with col2:
+        if 'ai_data' in st.session_state:
+            st.subheader("📝 Editable AI Output (Change Materials & Qty)")
+            st.caption("The AI has identified the following. You can click on any cell to change the material or correct the numbers.")
+            
+            # The Data Editor: Allows user to change materials and numbers!
+            edited_df = st.data_editor(
+                st.session_state['ai_data'], 
+                num_rows="dynamic",
+                use_container_width=True
+            )
+            
+            st.divider()
+            st.subheader("💰 Final Calculated BOQ")
+            
+            # Calculate final numbers based on the EDITABLE table
+            final_boq = []
+            for index, row in edited_df.iterrows():
+                # Floor calculation
+                final_boq.append({
+                    "Room": row["Room Name"],
+                    "Work Type": "Flooring",
+                    "Material": row["Floor Material"],
+                    "Net Qty": row["Floor Area (sqm)"],
+                    "Qty w/ Wastage": round(row["Floor Area (sqm)"] * (1 + wastage/100), 2),
+                    "Unit": "sqm"
+                })
+                # Wall calculation
+                wall_area = row["Perimeter (m)"] * wall_height
+                final_boq.append({
+                    "Room": row["Room Name"],
+                    "Work Type": "Wall Finish",
+                    "Material": row["Wall Material"],
+                    "Net Qty": wall_area,
+                    "Qty w/ Wastage": round(wall_area * (1 + wastage/100), 2),
+                    "Unit": "sqm"
+                })
+            
+            boq_df = pd.DataFrame(final_boq)
+            st.dataframe(boq_df, use_container_width=True)
+            
+            # Download Button
+            csv = boq_df.to_csv(index=False).encode('utf-8')
+            st.download_button("📥 Download Final BOQ (CSV)", csv, "AI_Calculated_BOQ.csv", "text/csv")
+
+
+# --- TAB 2: CAD AI ---
+with tab2:
+    st.info("Upload a DXF file. The system will extract the raw geometry and the AI will organize it into rooms and suggest materials.")
+    cad_file = st.file_uploader("Upload DXF File", type=["dxf"])
+    
+    if cad_file and st.button("🚀 Process CAD with AI", type="primary"):
+        if not openai_key:
+            st.error("⚠️ Please enter your OpenAI API Key in the sidebar.")
+        else:
+            with st.spinner("🤖 AI is interpreting CAD data..."):
+                raw_data = extract_raw_dxf_data(cad_file.read())
+                
+                if "Error" in raw_data:
+                    st.error(raw_data)
+                else:
+                    ai_cad_result = analyze_dxf_with_ai(raw_data, openai_key)
+                    cad_df = pd.DataFrame(ai_cad_result['rooms'])
+                    
+                    st.write("### AI Interpreted CAD Data")
+                    st.data_editor(cad_df, num_rows="dynamic", use_container_width=True)
