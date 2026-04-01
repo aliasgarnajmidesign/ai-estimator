@@ -2,7 +2,5 @@ streamlit
 pandas
 openpyxl
 ezdxf
-cloudconvert
-openai
-PyMuPDF
-Pillow
+pdfplumber
+pymupdf
