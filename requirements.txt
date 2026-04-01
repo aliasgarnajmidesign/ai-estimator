@@ -1,5 +1,8 @@
-setuptools
 streamlit
 pandas
-numpy
 openpyxl
+PyPDF2
+ezdxf
+cloudconvert
+requests
+xlsxwriter
